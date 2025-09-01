@@ -1,0 +1,578 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        Console.OutputEncoding = Encoding.UTF8; // for nice bullets
+        var opts = Options.Parse(args);
+        Console.WriteLine("\n=== Minimal Word2Vec (Skip-gram + Negative Sampling) ===\n");
+        Console.WriteLine(opts);
+
+        string path = opts.FilePath;
+        if (!File.Exists(path))
+        {
+            Console.WriteLine($"Could not find '{path}'. Put your corpus there or pass --file <path>.");
+            return;
+        }
+
+        var trainer = new Word2VecTrainer(
+            dim: opts.Dim,
+            window: opts.Window,
+            negatives: opts.Negatives,
+            minCount: opts.MinCount,
+            maxVocab: opts.MaxVocab,
+            epochs: opts.Epochs,
+            learningRate: opts.LearningRate,
+            subsampleT: opts.SubsampleT,
+            randomSeed: opts.Seed
+        );
+
+        var sw = Stopwatch.StartNew();
+        trainer.BuildVocab(path);
+        Console.WriteLine($"Vocab built in {sw.Elapsed}. Size={trainer.VocabSize}, TokensKept={trainer.TotalTrainTokens:N0}\n");
+
+        sw.Restart();
+        trainer.Train(path);
+        Console.WriteLine($"Training done in {sw.Elapsed}.\n");
+
+        trainer.NormalizeEmbeddings();
+
+        var viz = new ConsoleVisualizer();
+        viz.Scatter(trainer, topN: opts.TopNForPlot);
+
+        Console.WriteLine("\nType a word to see its nearest neighbors (or just press ENTER to exit):");
+        while (true)
+        {
+            Console.Write(" > ");
+            string? q = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(q)) break;
+            var neighbors = trainer.NearestNeighbors(q.Trim().ToLowerInvariant(), k: 10);
+            if (neighbors == null)
+            {
+                Console.WriteLine("  (unknown word)");
+                continue;
+            }
+            Console.WriteLine("  Nearest:");
+            foreach (var (w, s) in neighbors)
+            {
+                Console.WriteLine($"   - {w,-20} cos={s,6:F3}");
+            }
+        }
+
+        Console.WriteLine("Bye!\n");
+    }
+}
+
+sealed class Options
+{
+    public string FilePath { get; set; } = "trainData.txt";
+    public int Dim { get; set; } = 60;
+    public int Window { get; set; } = 5;
+    public int Negatives { get; set; } = 5;
+    public int MinCount { get; set; } = 5;
+    public int MaxVocab { get; set; } = 50000;
+    public int Epochs { get; set; } = 300;
+    public int TopNForPlot { get; set; } = 200;
+    public float LearningRate { get; set; } = 0.005f;
+    public float SubsampleT { get; set; } = 1e-5f; // set 0 to disable subsampling
+    public int Seed { get; set; } = 42;
+
+    public static Options Parse(string[] args)
+    {
+        var o = new Options();
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            string Next() => (i + 1 < args.Length) ? args[++i] : throw new ArgumentException($"Missing value after {a}");
+            switch (a)
+            {
+                case "--file": o.FilePath = Next(); break;
+                case "--dim": o.Dim = int.Parse(Next()); break;
+                case "--window": o.Window = int.Parse(Next()); break;
+                case "--neg": case "--negatives": o.Negatives = int.Parse(Next()); break;
+                case "--minCount": o.MinCount = int.Parse(Next()); break;
+                case "--maxVocab": o.MaxVocab = int.Parse(Next()); break;
+                case "--epochs": o.Epochs = int.Parse(Next()); break;
+                case "--top": o.TopNForPlot = int.Parse(Next()); break;
+                case "--lr": o.LearningRate = float.Parse(Next(), CultureInfo.InvariantCulture); break;
+                case "--subsampleT": o.SubsampleT = float.Parse(Next(), CultureInfo.InvariantCulture); break;
+                case "--seed": o.Seed = int.Parse(Next()); break;
+            }
+        }
+        return o;
+    }
+
+    public override string ToString()
+    {
+        return $"file={FilePath}, dim={Dim}, window={Window}, negatives={Negatives}, minCount={MinCount}, maxVocab={MaxVocab}, epochs={Epochs}, lr={LearningRate}, subsampleT={SubsampleT}, seed={Seed}, topNForPlot={TopNForPlot}";
+    }
+}
+
+sealed class Word2VecTrainer
+{
+    public int Dim { get; }
+    public int Window { get; }
+    public int Negatives { get; }
+    public int MinCount { get; }
+    public int MaxVocab { get; }
+    public int Epochs { get; }
+    public float InitialLR { get; }
+    public float SubsampleT { get; }
+    public int VocabSize => _id2word.Count;
+    public long TotalTrainTokens { get; private set; }
+
+    private readonly int _seed;
+    private readonly Dictionary<string, int> _word2id = new Dictionary<string, int>();
+    private readonly List<string> _id2word = new List<string>();
+    private long[] _counts = Array.Empty<long>();
+
+    // Embeddings
+    private float[] _syn0 = Array.Empty<float>(); // input vectors (word representations)
+    private float[] _syn1 = Array.Empty<float>(); // output vectors
+
+    // negative sampling table
+    private int[] _unigramTable = Array.Empty<int>();
+    private Random _rng;
+
+    // for subsampling
+    private double[] _keepProb = Array.Empty<double>();
+
+    public Word2VecTrainer(int dim, int window, int negatives, int minCount, int maxVocab, int epochs, float learningRate, float subsampleT, int randomSeed)
+    {
+        Dim = dim; Window = window; Negatives = negatives; MinCount = minCount; MaxVocab = maxVocab; Epochs = epochs;
+        InitialLR = learningRate; SubsampleT = subsampleT; _seed = randomSeed;
+        _rng = new Random(_seed);
+    }
+
+    public void BuildVocab(string path)
+    {
+        Console.WriteLine("Building vocabulary...");
+        var sw = Stopwatch.StartNew();
+        var freq = new Dictionary<string, long>(StringComparer.Ordinal);
+        long total = 0;
+        foreach (var tokens in TokenStream(path))
+        {
+            foreach (var t in tokens)
+            {
+                total++;
+                if (freq.TryGetValue(t, out var c)) freq[t] = c + 1; else freq[t] = 1;
+                if (total % 5_000_000 == 0) ConsoleWriteProgress("  tokens scanned", total);
+            }
+        }
+        ConsoleWriteProgress("  tokens scanned", total, end: true);
+
+        // Filter by minCount and cap vocab
+        var kept = freq.Where(kv => kv.Value >= MinCount)
+                       .OrderByDescending(kv => kv.Value)
+                       .Take(MaxVocab - 1) // reserve 1 for <unk>
+                       .ToList();
+        _word2id.Clear(); _id2word.Clear();
+        _word2id["<unk>"] = 0; _id2word.Add("<unk>");
+        foreach (var (w, c) in kept)
+        {
+            _word2id[w] = _id2word.Count;
+            _id2word.Add(w);
+        }
+        _counts = new long[_id2word.Count];
+        _counts[0] = 0; // unknown aggregated later
+        foreach (var (w, c) in kept) _counts[_word2id[w]] = c;
+        long known = kept.Sum(kv => kv.Value);
+        long unk = total - known;
+        _counts[0] = Math.Max(unk, 1);
+        TotalTrainTokens = known + unk;
+
+        // Subsampling keep probabilities (approx Word2Vec)
+        _keepProb = new double[_id2word.Count];
+        if (SubsampleT > 0)
+        {
+            double T = SubsampleT;
+            for (int i = 0; i < _keepProb.Length; i++)
+            {
+                double f = (double)_counts[i] / (double)TotalTrainTokens;
+                // Keep probability per Mikolov et al. (approx): p = (sqrt(f/T) + 1) * (T/f)
+                // Clamp to [0,1]. If f is small, p ~1; for very frequent words, p < 1.
+                double p = (Math.Sqrt(f / T) + 1.0) * (T / f);
+                if (p > 1.0) p = 1.0; if (p < 0) p = 0;
+                _keepProb[i] = p;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < _keepProb.Length; i++) _keepProb[i] = 1.0;
+        }
+
+        // Init embeddings
+        _syn0 = new float[VocabSize * Dim];
+        _syn1 = new float[VocabSize * Dim];
+        var rnd = new Random(_seed);
+        float scale = 0.5f / Dim; // small randoms
+        for (int i = 0; i < _syn0.Length; i++) _syn0[i] = (float)((rnd.NextDouble() * 2 - 1) * scale);
+        for (int i = 0; i < _syn1.Length; i++) _syn1[i] = 0f;
+
+        // Unigram table for negative sampling
+        Console.WriteLine("Building negative sampling table...");
+        BuildUnigramTable();
+        Console.WriteLine($"Vocab size: {VocabSize:N0} (including <unk>), total tokens: {TotalTrainTokens:N0}, time: {sw.Elapsed}\n");
+    }
+
+    private void BuildUnigramTable()
+    {
+        // Table size balances speed/memory. 1e6 ~ 4MB of ints.
+        int tableSize = 1_000_000;
+        _unigramTable = new int[tableSize];
+        double power = 0.75;
+        double sum = 0;
+        for (int i = 0; i < VocabSize; i++) sum += Math.Pow(_counts[i], power);
+        double cumulative = 0;
+        int idx = 0; double prev = 0;
+        for (int i = 0; i < VocabSize; i++)
+        {
+            cumulative += Math.Pow(_counts[i], power) / sum;
+            while ((double)idx / tableSize < cumulative && idx < tableSize)
+            {
+                _unigramTable[idx++] = i;
+            }
+            prev = cumulative;
+        }
+        for (; idx < tableSize; idx++) _unigramTable[idx] = VocabSize - 1; // fill tail
+    }
+
+    public void Train(string path)
+    {
+        Console.WriteLine("Training...");
+        long trainedTokens = 0;
+        double lr = InitialLR;
+        long reportEvery = 2_000_000; // tokens
+        var sw = Stopwatch.StartNew();
+
+        for (int epoch = 1; epoch <= Epochs; epoch++)
+        {
+            Console.WriteLine($"Epoch {epoch}/{Epochs}");
+            foreach (var tokens in TokenStream(path))
+            {
+                var ids = MapTokens(tokens, applySubsampling: true);
+                if (ids.Count == 0) continue;
+                for (int i = 0; i < ids.Count; i++)
+                {
+                    int inputId = ids[i]; if (inputId < 0) continue;
+                    int b = _rng.Next(Window) + 1; // dynamic window per word2vec
+                    for (int a = -Window; a <= Window; a++)
+                    {
+                        if (a == 0) continue;
+                        if (a > -b && a < b) continue; // skip small offsets inside b
+                        int j = i + a; if (j < 0 || j >= ids.Count) continue;
+                        int outputId = ids[j]; if (outputId < 0) continue;
+                        TrainPair(inputId, outputId, (float)lr);
+                    }
+                    trainedTokens++;
+                    if (trainedTokens % reportEvery == 0)
+                    {
+                        // linear decay of lr
+                        lr = InitialLR * Math.Max(0.0001, 1.0 - (double)trainedTokens / (Epochs * TotalTrainTokens));
+                        ConsoleWriteProgress("  tokens trained", trainedTokens, prefix: $"  lr={lr:F4}");
+                    }
+                }
+            }
+            ConsoleWriteProgress("  tokens trained", trainedTokens, prefix: $"  lr={(float)lr:F4}", end: true);
+        }
+        Console.WriteLine($"Done. Total tokens trained: {trainedTokens:N0}. Elapsed {sw.Elapsed}.");
+    }
+
+    private void TrainPair(int inputId, int outputId, float lr)
+    {
+        int dim = Dim;
+        int inOff = inputId * dim;
+        int outOff = outputId * dim;
+
+        // Positive sample
+        Update(inOff, outOff, 1f, lr);
+
+        // Negatives
+        for (int n = 0; n < Negatives; n++)
+        {
+            int negId;
+            do { negId = _unigramTable[_rng.Next(_unigramTable.Length)]; } while (negId == outputId);
+            int negOff = negId * dim;
+            Update(inOff, negOff, 0f, lr);
+        }
+    }
+
+    private void Update(int inOff, int outOff, float label, float lr)
+    {
+        float dot = 0f;
+        for (int d = 0; d < Dim; d++) dot += _syn0[inOff + d] * _syn1[outOff + d];
+        float pred = Sigmoid(dot);
+        float g = (label - pred) * lr;
+        // SGD update
+        for (int d = 0; d < Dim; d++)
+        {
+            float u = _syn0[inOff + d];
+            float v = _syn1[outOff + d];
+            _syn0[inOff + d] = u + g * v;
+            _syn1[outOff + d] = v + g * u;
+        }
+    }
+
+    public void NormalizeEmbeddings()
+    {
+        for (int i = 0; i < VocabSize; i++)
+        {
+            int off = i * Dim; float norm = 0f;
+            for (int d = 0; d < Dim; d++) norm += _syn0[off + d] * _syn0[off + d];
+            norm = (float)Math.Sqrt(norm) + 1e-8f;
+            for (int d = 0; d < Dim; d++) _syn0[off + d] /= norm;
+        }
+    }
+
+    public List<(string word, double sim)>? NearestNeighbors(string word, int k)
+    {
+        if (!_word2id.TryGetValue(word, out int id)) return null;
+        int off = id * Dim;
+        var sims = new List<(int id, double sim)>(VocabSize);
+        for (int j = 0; j < VocabSize; j++)
+        {
+            if (j == id) continue;
+            double dot = 0;
+            int off2 = j * Dim;
+            for (int d = 0; d < Dim; d++) dot += _syn0[off + d] * _syn0[off2 + d];
+            sims.Add((j, dot));
+        }
+        sims.Sort((a, b) => b.sim.CompareTo(a.sim));
+        return sims.Take(k).Select(p => (_id2word[p.id], p.sim)).ToList();
+    }
+
+    // ---- Helpers ----
+    private static float Sigmoid(float x)
+    {
+        if (x > 6) return 0.9975f; // avoid exp overflow, close to 1
+        if (x < -6) return 0.0025f; // close to 0
+        return 1f / (1f + (float)Math.Exp(-x));
+    }
+
+    private static IEnumerable<List<string>> TokenStream(string path)
+    {
+        // Stream tokens per line. Lowercase, keep a-z letters only.
+        var re = new Regex("[a-zA-Z]+", RegexOptions.Compiled);
+        using var sr = new StreamReader(path);
+        string? line;
+        while ((line = sr.ReadLine()) != null)
+        {
+            var matches = re.Matches(line);
+            if (matches.Count == 0) { yield return new List<string>(); continue; }
+            var list = new List<string>(matches.Count);
+            foreach (Match m in matches)
+            {
+                var w = m.Value.ToLowerInvariant();
+                list.Add(w);
+            }
+            yield return list;
+        }
+    }
+
+    private List<int> MapTokens(List<string> tokens, bool applySubsampling)
+    {
+        var ids = new List<int>(tokens.Count);
+        foreach (var t in tokens)
+        {
+            int id = _word2id.TryGetValue(t, out int v) ? v : 0; // unk -> 0
+            if (!applySubsampling || _rng.NextDouble() < _keepProb[id])
+                ids.Add(id);
+        }
+        return ids;
+    }
+
+    private static void ConsoleWriteProgress(string label, long value, string prefix = "", bool end = false)
+    {
+        if (!end)
+        {
+            Console.Write($"\r{prefix} {label}: {value:N0}   ");
+        }
+        else
+        {
+            Console.WriteLine($"\r{prefix} {label}: {value:N0}        ");
+        }
+    }
+
+    // Expose for visualization
+    public IEnumerable<(string word, float[] vec, long count)> TopWords(int n)
+    {
+        n = Math.Min(n, VocabSize);
+        var order = Enumerable.Range(0, VocabSize).OrderByDescending(i => _counts[i]).Take(n);
+        foreach (var i in order)
+        {
+            var v = new float[Dim]; Array.Copy(_syn0, i * Dim, v, 0, Dim);
+            yield return (_id2word[i], v, _counts[i]);
+        }
+    }
+}
+
+sealed class ConsoleVisualizer
+{
+    public void Scatter(Word2VecTrainer model, int topN = 200)
+    {
+        Console.WriteLine($"\nVisualizing top {topN} words with PCA → ASCII scatter plot\n");
+
+        // Collect vectors
+        var items = model.TopWords(topN).ToList();
+        if (items.Count < 3) { Console.WriteLine("Not enough words to plot."); return; }
+        int n = items.Count;
+        int d = items[0].vec.Length;
+
+        // Center data
+        var X = new float[n][];
+        for (int i = 0; i < n; i++) X[i] = (float[])items[i].vec.Clone();
+        var mean = new float[d];
+        for (int i = 0; i < n; i++) for (int j = 0; j < d; j++) mean[j] += X[i][j];
+        for (int j = 0; j < d; j++) mean[j] /= n;
+        for (int i = 0; i < n; i++) for (int j = 0; j < d; j++) X[i][j] -= mean[j];
+
+        // Power iteration to get top-2 principal components
+        var (pc1, pc2) = PowerPCA2(X, iters: 60);
+
+        // Project
+        var pts = new (double x, double y)[n];
+        double minx = double.MaxValue, maxx = double.MinValue;
+        double miny = double.MaxValue, maxy = double.MinValue;
+        for (int i = 0; i < n; i++)
+        {
+            double x = Dot(X[i], pc1);
+            double y = Dot(X[i], pc2);
+            pts[i] = (x, y);
+            if (x < minx) minx = x; if (x > maxx) maxx = x;
+            if (y < miny) miny = y; if (y > maxy) maxy = y;
+        }
+
+        int width = Math.Max(60, Math.Min(Console.BufferWidth - 2, 160));
+        int height = Math.Max(24, Math.Min(Console.WindowHeight - 6, 60));
+        var grid = new char[height, width];
+        var colorIdx = new int[height, width];
+        for (int r = 0; r < height; r++) for (int c = 0; c < width; c++) { grid[r, c] = '·'; colorIdx[r, c] = -1; }
+
+        // Map to grid
+        for (int i = 0; i < n; i++)
+        {
+            int col = (int)Math.Round((pts[i].x - minx) / (maxx - minx + 1e-9) * (width - 1));
+            int row = (int)Math.Round((pts[i].y - miny) / (maxy - miny + 1e-9) * (height - 1));
+            row = (height - 1) - row; // flip y for display
+            col = Math.Clamp(col, 0, width - 1);
+            row = Math.Clamp(row, 0, height - 1);
+            grid[row, col] = '•';
+            colorIdx[row, col] = HashToColor(items[i].word);
+        }
+
+        // Draw frame and plot
+        Console.WriteLine("┌" + new string('─', width) + "┐");
+        for (int r = 0; r < height; r++)
+        {
+            Console.Write("│");
+            for (int c = 0; c < width; c++)
+            {
+                int ci = colorIdx[r, c];
+                if (ci >= 0) Console.ForegroundColor = ColorPalette[ci];
+                Console.Write(grid[r, c]);
+                Console.ResetColor();
+            }
+            Console.WriteLine("│");
+        }
+        Console.WriteLine("└" + new string('─', width) + "┘");
+
+        // Label a few of the most frequent words near their plotted cell (printed underneath as legend)
+        Console.WriteLine("Legend (top 20 by frequency):");
+        foreach (var (word, vec, cnt) in items.Take(20))
+        {
+            Console.ForegroundColor = ColorPalette[HashToColor(word)];
+            Console.Write("● ");
+            Console.ResetColor();
+            Console.WriteLine($"{word} (count={cnt})");
+        }
+        Console.WriteLine();
+    }
+
+    private static (double[] pc1, double[] pc2) PowerPCA2(float[][] X, int iters = 50)
+    {
+        int n = X.Length; int d = X[0].Length;
+        var rng = new Random(123);
+        double[] v1 = RandomUnit(d, rng);
+        for (int it = 0; it < iters; it++)
+        {
+            var w = XtXv(X, v1); Normalize(w); v1 = w;
+        }
+        // Second component orthogonal to first
+        double[] v2 = RandomUnit(d, rng);
+        for (int it = 0; it < iters; it++)
+        {
+            var w = XtXv(X, v2);
+            // deflate against v1
+            double proj = Dot(v1, w);
+            for (int j = 0; j < d; j++) w[j] -= proj * v1[j];
+            Normalize(w); v2 = w;
+        }
+        return (v1, v2);
+    }
+
+    private static double[] XtXv(float[][] X, double[] v)
+    {
+        int n = X.Length; int d = X[0].Length;
+        var tmp = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            double s = 0; var xi = X[i];
+            for (int j = 0; j < d; j++) s += xi[j] * v[j];
+            tmp[i] = s;
+        }
+        var w = new double[d];
+        for (int i = 0; i < n; i++)
+        {
+            var xi = X[i]; double s = tmp[i];
+            for (int j = 0; j < d; j++) w[j] += xi[j] * s;
+        }
+        return w;
+    }
+
+    private static double[] RandomUnit(int d, Random rng)
+    {
+        var v = new double[d];
+        for (int j = 0; j < d; j++) v[j] = rng.NextDouble() * 2 - 1;
+        Normalize(v); return v;
+    }
+
+    private static void Normalize(double[] v)
+    {
+        double n = 0; for (int j = 0; j < v.Length; j++) n += v[j] * v[j];
+        n = Math.Sqrt(n) + 1e-12; for (int j = 0; j < v.Length; j++) v[j] /= n;
+    }
+
+    private static double Dot(float[] a, double[] b)
+    {
+        double s = 0; for (int j = 0; j < a.Length; j++) s += a[j] * b[j]; return s;
+    }
+
+    private static double Dot(double[] a, double[] b)
+    {
+        double s = 0; for (int j = 0; j < a.Length; j++) s += a[j] * b[j]; return s;
+    }
+
+    private static readonly ConsoleColor[] ColorPalette = new[]
+    {
+        ConsoleColor.Cyan, ConsoleColor.Yellow, ConsoleColor.Magenta, ConsoleColor.Green,
+        ConsoleColor.Blue, ConsoleColor.Red, ConsoleColor.White, ConsoleColor.Gray,
+        ConsoleColor.DarkCyan, ConsoleColor.DarkYellow, ConsoleColor.DarkMagenta, ConsoleColor.DarkGreen,
+        ConsoleColor.DarkBlue, ConsoleColor.DarkRed
+    };
+
+    private static int HashToColor(string s)
+    {
+        unchecked
+        {
+            int h = 23; foreach (char c in s) h = h * 31 + c; if (h < 0) h = -h; return h % ColorPalette.Length;
+        }
+    }
+}
